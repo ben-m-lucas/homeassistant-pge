@@ -23,7 +23,7 @@ from homeassistant.const import (
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .api_host import get_resolver, public_hostname
+from .api_host import public_hostname, resolver_from_client
 from .bill_pdf_statistics import BILL_PDF_METRIC_SUFFIXES, get_bill_pdf_statistic_suffix
 from .bill_pdf_store import normalized_from_entry
 from .billing_models import BillDetails, EnergyTrackerEstimates
@@ -764,7 +764,7 @@ class PGESyncStatusSensor(PGEBaseEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        resolver = get_resolver()
+        resolver = resolver_from_client(getattr(self.coordinator, "client", None))
         host = resolver.sticky
         return {
             "api_host": public_hostname(host) if host else None,

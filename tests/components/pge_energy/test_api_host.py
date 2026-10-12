@@ -18,9 +18,11 @@ from custom_components.pge_energy.api_host import (
     FailureClass,
     HostOverrideError,
     accept_discovered_host,
+    apply_configured_host,
     bill_pdf_url,
     classify_http,
     extra_candidate_origins,
+    forget_resolver,
     graphql_url,
     host_detail,
     parse_host_override,
@@ -45,6 +47,7 @@ from custom_components.pge_energy.exceptions import (
     PGERateLimitError,
 )
 from custom_components.pge_energy.models import UsageResolution
+from custom_components.pge_energy.portal_auth import _post_json
 from custom_components.pge_energy.store import ImportStoreData
 
 _COMPONENT_ROOT = Path(__file__).resolve().parents[3] / "custom_components"
@@ -153,6 +156,10 @@ def test_probe_is_alive_matches_the_unauthenticated_checks() -> None:
     assert probe_is_alive(501, content_type="text/plain", body="no") is True
     assert probe_is_alive(503, content_type="text/plain", body="upstream connect error") is False
     assert probe_is_alive(400, content_type="text/plain", body="upstream connect error") is False
+    assert probe_is_alive(401, strict=True) is True
+    assert probe_is_alive(403, content_type="text/html", body="<html>", strict=True) is False
+    assert probe_is_alive(200, strict=True) is False
+    assert probe_is_alive(501, strict=True) is False
 
 
 @pytest.mark.asyncio
@@ -285,14 +292,65 @@ async def test_label_candidate_is_probed_before_it_can_take_credentials(
     assert "api-gw.portlandgeneral.com" in caplog.text
 
 
-def test_circuit_breaker_skips_a_host_after_repeated_failures() -> None:
+@pytest.mark.asyncio
+async def test_guessed_host_403_never_receives_credentials() -> None:
+    resolver = ApiHostResolver()
+    for origin in PGE_API_HOSTS:
+        resolver.mark_failure(origin, status=503)
+        resolver.mark_failure(origin, status=503)
+
+    def handler(url: str, kwargs: dict) -> _Resp:
+        assert kwargs["headers"]["idp_access_token"] == PROBE_IDP_TOKEN
+        assert "authorization" not in {key.lower() for key in kwargs["headers"]}
+        if url.startswith("https://portal.portlandgeneral.com"):
+            return _Resp(401, b"")
+        if url.startswith(PGE_API_HOSTS[0]):
+            return _Resp(503, b"upstream connect error")
+        return _Resp(403, b"<html>", "text/html")
+
+    session = _Session(handler)
+    origin = await resolver.acquire(session)  # type: ignore[arg-type]
+    assert origin == "https://portal.portlandgeneral.com"
+    assert any(url.startswith("https://api-gw.portlandgeneral.com") for url, _kwargs in session.calls)
+    assert all(kwargs["headers"]["idp_access_token"] == PROBE_IDP_TOKEN for _url, kwargs in session.calls)
+
+
+def test_circuit_breaker_still_probes_a_cooled_preferred_host() -> None:
     resolver = ApiHostResolver(now=lambda: 1_000.0)
     host = PGE_API_HOSTS[0]
+    other = PGE_API_HOSTS[1]
     for _ in range(FAILURES_BEFORE_OPEN):
         resolver.mark_failure(host, status=503)
-    assert host not in resolver.candidates()
+    assert host in resolver.candidates()
+    for _ in range(FAILURES_BEFORE_OPEN):
+        resolver.mark_failure(other, status=503)
+    chosen = resolver.candidates()
+    assert host in chosen
+    assert other not in chosen
     resolver.mark_success(host, reason="recovered")
     assert resolver.sticky == host
+
+
+def test_clearing_the_override_leaves_the_old_pin() -> None:
+    resolver = ApiHostResolver()
+    pin = "https://gw.portlandgeneral.com"
+    resolver.set_override(pin)
+    resolver.mark_success(pin, reason="operator override passed the credential-free probe")
+    resolver.set_override(None)
+    assert resolver.sticky is None
+    assert resolver.candidates()[0] == PGE_API_HOSTS[0]
+
+
+def test_each_entry_keeps_its_own_override() -> None:
+    try:
+        first = apply_configured_host("https://apix.portlandgeneral.com", "entry-a")
+        second = apply_configured_host(None, "entry-b")
+        assert first is not second
+        assert first.candidates()[0] == "https://apix.portlandgeneral.com"
+        assert second.candidates()[0] == PGE_API_HOSTS[0]
+    finally:
+        forget_resolver("entry-a")
+        forget_resolver("entry-b")
 
 
 @pytest.mark.asyncio
@@ -312,6 +370,13 @@ async def test_return_to_preferred_when_the_higher_host_recovers(caplog: pytest.
     again = await resolver.acquire(session)  # type: ignore[arg-type]
     assert again == PGE_API_HOSTS[0]
     assert session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_text_plain_401_is_an_auth_error_before_json_parsing() -> None:
+    session = _Session(lambda _url, _kwargs: _Resp(401, b"denied"))
+    with pytest.raises(PGEAuthenticationError):
+        await _post_json(session, f"{PGE_API_HOSTS[0]}/token", headers={}, body=None)
 
 
 @pytest.mark.asyncio

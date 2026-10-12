@@ -208,14 +208,26 @@ def host_detail(detail: str, url_or_host: str) -> str:
     return f"{detail} (host {host})"
 
 
-def probe_is_alive(status: int, *, content_type: str | None = None, body: str | None = None) -> bool:
+def probe_is_alive(
+    status: int,
+    *,
+    content_type: str | None = None,
+    body: str | None = None,
+    strict: bool = False,
+) -> bool:
     """Interpret the credential-free token probe.
 
-    Alive: HTTP 401 even when the body is text/plain, HTTP 400 with JSON,
-    any 2xx, and HTTP 403, 429, or 501. Dead: HTTP 502, 503, 504, or a
-    non-JSON body on any other status. Timeouts are dead and never reach
-    this function.
+    Listed hosts and an operator override use the loose check: HTTP 401 even
+    when the body is text/plain, HTTP 400 with JSON, any 2xx, and HTTP 403,
+    429, or 501. Dead: HTTP 502, 503, 504, or a non-JSON body on any other
+    status.
+
+    A guessed label uses ``strict``. Only HTTP 401 counts. A CDN or marketing
+    site that answers 403 or 200 never receives a token. Timeouts are dead
+    and never reach this function.
     """
+    if strict:
+        return status == 401
     if status in (502, 503, 504):
         return False
     if status in (401, 403, 429, 501) or status < 400:
@@ -279,12 +291,29 @@ class ApiHostResolver:
         return self._last_switch_reason
 
     def set_override(self, origin: str | None) -> None:
-        """Remember an operator origin. Logged once, hostname only."""
+        """Remember an operator origin. Logged once, hostname only.
+
+        Clearing the pin drops that host from sticky and last-known-good so
+        the next request returns to the preferred list instead of waiting
+        for a failure or the 24 hour recheck.
+        """
         if origin == self._override:
             return
+        previous = self._override
         self._override = origin
         if origin:
             _LOGGER.info("PGE API host override: %s", public_hostname(origin))
+            return
+        if not previous:
+            return
+        self._verified.discard(previous)
+        if self._sticky == previous:
+            self._sticky = None
+        if self._last_known_good == previous:
+            self._last_known_good = None
+        if self._announced == previous:
+            self._announced = None
+        _LOGGER.info("PGE API host override cleared: %s", public_hostname(previous))
 
     def mark_verified_for_tests(self, origin: str) -> None:
         """Treat ``origin`` as already probed. Production code does not call this."""
@@ -334,11 +363,30 @@ class ApiHostResolver:
             add(origin)
         add(self._last_known_good)
         chosen = ordered[:MAX_PROBES_PER_CYCLE]
+        chosen = self._keep_preferred_probe(chosen)
         _LOGGER.debug(
             "PGE API host candidates: %s",
             ", ".join(public_hostname(origin) for origin in chosen),
         )
         return chosen
+
+    def _keep_preferred_probe(self, chosen: list[str]) -> list[str]:
+        """Probe the preferred host once per cycle when cooldown would hide it.
+
+        A guessed label can still be tried. The preferred host is added back
+        when it is the only configured host cooling down, or when cooldown
+        has removed every configured host.
+        """
+        if not self.origins:
+            return chosen
+        preferred = self.origins[0]
+        if preferred in chosen or not self.in_cooldown(preferred):
+            return chosen
+        others_cooling = any(self.in_cooldown(origin) for origin in self.origins[1:])
+        listed_ready = any(origin in chosen for origin in self.origins)
+        if others_cooling and listed_ready:
+            return chosen
+        return [preferred, *chosen][:MAX_PROBES_PER_CYCLE]
 
     async def probe(self, session: aiohttp.ClientSession, origin: str) -> bool:
         """POST the token route with a fake id token. No account data is sent."""
@@ -355,7 +403,13 @@ class ApiHostResolver:
             ) as resp:
                 raw = await resp.read()
                 text = raw.decode("utf-8", errors="replace")[:300]
-                alive = probe_is_alive(resp.status, content_type=content_type_of(resp), body=text)
+                strict = origin not in self.origins and origin != self._override
+                alive = probe_is_alive(
+                    resp.status,
+                    content_type=content_type_of(resp),
+                    body=text,
+                    strict=strict,
+                )
         except (TimeoutError, aiohttp.ClientError):
             alive = False
         _LOGGER.debug(
@@ -496,11 +550,42 @@ def accept_discovered_host(hostname: str) -> str | None:
 
 
 _RESOLVER: ApiHostResolver | None = None
+_ENTRY_RESOLVERS: dict[str, ApiHostResolver] = {}
 
 
-def apply_configured_host(option: str | None) -> None:
-    """Point the process resolver at the env or config-entry override."""
-    get_resolver().set_override(resolve_operator_override(option))
+def apply_configured_host(option: str | None, entry_id: str | None = None) -> ApiHostResolver:
+    """Point one entry's resolver at the env or config-entry override.
+
+    Each config entry keeps its own resolver. A blank option on one entry
+    does not clear another entry's pin, and one entry's pin is not used for
+    the other entry's credentials. Callers without an entry id still share
+    the process resolver.
+    """
+    resolver = resolver_for_entry(entry_id) if entry_id else get_resolver()
+    resolver.set_override(resolve_operator_override(option))
+    return resolver
+
+
+def resolver_for_entry(entry_id: str) -> ApiHostResolver:
+    """Return the resolver owned by one config entry, creating it if needed."""
+    resolver = _ENTRY_RESOLVERS.get(entry_id)
+    if resolver is None:
+        resolver = ApiHostResolver()
+        _ENTRY_RESOLVERS[entry_id] = resolver
+    return resolver
+
+
+def forget_resolver(entry_id: str) -> None:
+    """Drop an entry resolver on unload."""
+    _ENTRY_RESOLVERS.pop(entry_id, None)
+
+
+def resolver_from_client(client: Any) -> ApiHostResolver:
+    """Use the client's resolver when it is a real one, else the process resolver."""
+    resolver = getattr(client, "host_resolver", None)
+    if isinstance(resolver, ApiHostResolver):
+        return resolver
+    return get_resolver()
 
 
 def get_resolver() -> ApiHostResolver:

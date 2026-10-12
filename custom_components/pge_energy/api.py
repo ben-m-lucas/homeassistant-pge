@@ -411,6 +411,7 @@ class PGEApiClient:
             self._legacy_person_id = None
             self._legacy_account_id = None
         self._hosts = host_resolver or get_resolver()
+        self.host_resolver = self._hosts
         self._rate_limit_until: datetime | None = None
         self._capture_graphql_diagnostics = capture_graphql_diagnostics
         self._captured_requests: set[tuple[UsageResolution, str, str]] = set()

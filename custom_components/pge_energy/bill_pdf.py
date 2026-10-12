@@ -14,7 +14,7 @@ import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client
 
-from .api_host import MAX_AUTH_ATTEMPTS, bill_pdf_url, get_resolver, host_detail
+from .api_host import MAX_AUTH_ATTEMPTS, ApiHostResolver, bill_pdf_url, get_resolver, host_detail
 from .auth import PGEAuthManager
 from .bill_pdf_models import BillPdfFileRecord, BillPdfForm
 from .bill_pdf_parser import sha256_pdf, validate_pdf_bytes
@@ -88,7 +88,7 @@ async def async_download_bill_pdf(
     }
     session = aiohttp_client.async_get_clientsession(hass)
 
-    hosts = get_resolver()
+    hosts = auth.host_resolver if isinstance(auth.host_resolver, ApiHostResolver) else get_resolver()
     renewed = False
     exclude: set[str] = set()
     last_error: PGEConnectionError | None = None

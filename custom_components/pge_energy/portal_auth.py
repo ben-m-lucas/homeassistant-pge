@@ -14,7 +14,14 @@ from typing import Any
 
 import aiohttp
 
-from .api_host import MAX_AUTH_ATTEMPTS, get_resolver, graphql_url, host_detail, token_exchange_url
+from .api_host import (
+    MAX_AUTH_ATTEMPTS,
+    ApiHostResolver,
+    get_resolver,
+    graphql_url,
+    host_detail,
+    token_exchange_url,
+)
 from .billing_api import account_detail_list_params
 from .const import (
     COGNITO_RATE_LIMIT_DEFAULT_SECONDS,
@@ -181,6 +188,8 @@ async def _post_json(
         if body is not None:
             request_kwargs["json"] = body
         async with session.post(url, **request_kwargs) as resp:
+            if resp.status == 401:
+                raise PGEAuthenticationError(host_detail("PGE auth rejected (HTTP 401)", url))
             try:
                 payload = await resp.json(content_type=None)
             except Exception as exc:  # noqa: BLE001
@@ -226,8 +235,9 @@ async def _cognito_initiate_auth(
 async def _apigee_exchange_id_token(
     session: aiohttp.ClientSession,
     id_token: str,
+    resolver: ApiHostResolver | None = None,
 ) -> tuple[str, datetime | None]:
-    resolver = get_resolver()
+    resolver = resolver or get_resolver()
     exclude: set[str] = set()
     last_error: PGEConnectionError | None = None
     for _attempt in range(MAX_AUTH_ATTEMPTS):
@@ -377,6 +387,7 @@ async def _enumerate_accounts_via_detail_list(
     access_token: str,
     *,
     headers: dict[str, str],
+    origin: str | None = None,
 ) -> tuple[str | None, list[str]]:
     """Enumerate ACTIVE accounts via the portal account-switcher op."""
     body = {
@@ -385,7 +396,7 @@ async def _enumerate_accounts_via_detail_list(
         "variables": {"params": account_detail_list_params()},
     }
     request_headers = {**headers, "Authorization": f"Bearer {access_token}"}
-    status, payload = await _post_json(session, graphql_url(), headers=request_headers, body=body)
+    status, payload = await _post_json(session, graphql_url(origin), headers=request_headers, body=body)
     classify_challenge(payload)
     if status >= 400:
         raise PGEAuthenticationError(f"PGE account detail list failed (HTTP {status})")
@@ -400,6 +411,7 @@ async def _enumerate_accounts_via_detail_list(
 async def _discover_accounts(
     session: aiohttp.ClientSession,
     access_token: str,
+    origin: str | None = None,
 ) -> tuple[str | None, list[str]]:
     headers = {
         "Authorization": f"Bearer {access_token}",
@@ -414,7 +426,7 @@ async def _discover_accounts(
         "query": _GET_ACCOUNT_INFO,
         "variables": {"params": None},
     }
-    status, payload = await _post_json(session, graphql_url(), headers=headers, body=body)
+    status, payload = await _post_json(session, graphql_url(origin), headers=headers, body=body)
     classify_challenge(payload)
     if status >= 400:
         raise PGEAuthenticationError(f"PGE account discovery failed (HTTP {status})")
@@ -435,7 +447,7 @@ async def _discover_accounts(
     if total_accounts is None or total_accounts > len(default_ids):
         try:
             detail_person, detail_ids = await _enumerate_accounts_via_detail_list(
-                session, access_token, headers=headers
+                session, access_token, headers=headers, origin=origin
             )
             if person_id is None and detail_person:
                 person_id = detail_person
@@ -465,6 +477,7 @@ async def _login_with_password(
     *,
     email: str,
     password: str,
+    host_resolver: ApiHostResolver | None = None,
 ) -> PortalAuthResult:
     auth_result: dict[str, Any] | None = None
     last_connection_error: Exception | None = None
@@ -500,8 +513,9 @@ async def _login_with_password(
     if not isinstance(id_token, str) or not id_token:
         raise PGEAuthenticationError("PGE Cognito response missing IdToken")
 
-    access_token, expires_at = await _apigee_exchange_id_token(session, id_token)
-    person_id, account_ids = await _discover_accounts(session, access_token)
+    resolver = host_resolver or get_resolver()
+    access_token, expires_at = await _apigee_exchange_id_token(session, id_token, resolver)
+    person_id, account_ids = await _discover_accounts(session, access_token, resolver.sticky)
     return PortalAuthResult(
         access_token=access_token,
         encrypted_person_id=person_id,
@@ -515,6 +529,7 @@ async def _refresh_with_cognito_token(
     session: aiohttp.ClientSession,
     *,
     refresh_credential: str,
+    host_resolver: ApiHostResolver | None = None,
 ) -> PortalAuthResult:
     auth_result = await _cognito_initiate_auth(
         session,
@@ -526,8 +541,9 @@ async def _refresh_with_cognito_token(
         raise PGEAuthenticationError("PGE Cognito refresh missing IdToken")
     # RefreshToken is often omitted on REFRESH_TOKEN_AUTH; keep the prior credential.
     new_refresh = auth_result.get("RefreshToken")
-    access_token, expires_at = await _apigee_exchange_id_token(session, id_token)
-    person_id, account_ids = await _discover_accounts(session, access_token)
+    resolver = host_resolver or get_resolver()
+    access_token, expires_at = await _apigee_exchange_id_token(session, id_token, resolver)
+    person_id, account_ids = await _discover_accounts(session, access_token, resolver.sticky)
     return PortalAuthResult(
         access_token=access_token,
         encrypted_person_id=person_id,
@@ -542,6 +558,7 @@ async def async_login_or_refresh(
     email: str,
     password: str | None,
     refresh_credential: str | None,
+    host_resolver: ApiHostResolver | None = None,
 ) -> PortalAuthResult:
     """Obtain a fresh Apigee bearer token.
 
@@ -557,7 +574,12 @@ async def async_login_or_refresh(
     async with aiohttp.ClientSession(timeout=timeout) as session:
         if password:
             try:
-                return await _login_with_password(session, email=email, password=password)
+                return await _login_with_password(
+                    session,
+                    email=email,
+                    password=password,
+                    host_resolver=host_resolver,
+                )
             except (PGEMfaUnsupportedError, PGECaptchaUnsupportedError, PGERateLimitError):
                 # Never amplify Cognito throttle/lockout with a second InitiateAuth.
                 raise
@@ -567,6 +589,10 @@ async def async_login_or_refresh(
                 _LOGGER.info("PGE password login failed; falling back to refresh credential")
 
         if refresh_credential:
-            return await _refresh_with_cognito_token(session, refresh_credential=refresh_credential)
+            return await _refresh_with_cognito_token(
+                session,
+                refresh_credential=refresh_credential,
+                host_resolver=host_resolver,
+            )
 
         raise PGEAuthenticationError("Password or refresh credential required for PGE login")

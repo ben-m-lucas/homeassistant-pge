@@ -6,7 +6,9 @@
 - [x] HTTP failure classes: 401/403/429 stay put. 502/503/504 and non-JSON gateway bodies fail over.
 - [x] Resolver: credential-free probe, no same-host retry ladder, circuit breaker, 24h return to the preferred host.
 - [x] Operator pin: `PGE_API_HOST` wins over Configure → API host. Foreign hosts require the unsupported opt-in.
-- [x] Bounded sibling labels are probed before credentials.
+- [x] Bounded sibling labels are probed before credentials. A guessed label must return HTTP 401. Listed hosts and an operator pin keep the looser probe.
+- [x] Token-exchange HTTP 401 is an auth error and does not open a host cooldown.
+- [x] Each config entry has its own host resolver. Clearing a pin stops traffic to that host. A cooled preferred host can still be probed once per cycle.
 - [x] Sync status, diagnostics, and import Store record the sticky host. No tokens in that snapshot.
 - [ ] Publish GitHub Release `v0.11.0` only after an explicit request, and only once CI is green on the pushed SHA.
 - [ ] Live HA UAT on this branch after the main checkout is no longer mid-merge.

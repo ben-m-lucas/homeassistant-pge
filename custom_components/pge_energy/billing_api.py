@@ -10,6 +10,7 @@ import aiohttp
 
 from .api_host import (
     MAX_AUTH_ATTEMPTS,
+    ApiHostResolver,
     FailureClass,
     classify_http,
     content_type_of,
@@ -484,7 +485,9 @@ class PGEBillingApiClient:
             "operationName": operation_name,
         }
 
-        hosts = get_resolver()
+        hosts = self._auth_manager.host_resolver
+        if not isinstance(hosts, ApiHostResolver):
+            hosts = get_resolver()
         renewed = False
         exclude: set[str] = set()
         last_error: PGEConnectionError | None = None
