@@ -11,14 +11,16 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlencode
 
 import aiohttp
 
+from .api_host import MAX_AUTH_ATTEMPTS, get_resolver, graphql_url, host_detail, token_exchange_url
 from .billing_api import account_detail_list_params
 from .const import (
     COGNITO_RATE_LIMIT_DEFAULT_SECONDS,
     COGNITO_RATE_LIMIT_LOCKOUT_SECONDS,
+    PGE_PORTAL_ORIGIN,
+    PGE_PORTAL_REFERER,
 )
 from .exceptions import (
     PGEAuthenticationError,
@@ -30,20 +32,13 @@ from .exceptions import (
 
 _LOGGER = logging.getLogger(__name__)
 
-# Observed production config from portlandgeneral.com app.js (2026-07-23).
+# Observed production Cognito config from the portal app bundle (2026-07-23).
 COGNITO_REGION = "us-west-2"
 COGNITO_CLIENT_ID = "4q9nbgmi0gcks5t7d6fkhubfnm"
 COGNITO_USER_POOL_ID = "us-west-2_rnEzd20tN"
 COGNITO_URL = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/"
 COGNITO_AUTH_FLOW = "USER_PASSWORD_AUTH"
 COGNITO_REFRESH_FLOW = "REFRESH_TOKEN_AUTH"
-
-# api.portlandgeneral.com as of 2026-10-09; apix.portlandgeneral.com returns 503.
-APIGEE_AUTH_BASE = "https://api.portlandgeneral.com"
-APIGEE_CLIENT_ID = "rHuS10KrfsLwFAr2sZ7MHh7oHELGx6YK"
-APIGEE_TOKEN_PATH = "/pg-token-implicit-aws/token"
-
-GRAPHQL_URL = "https://api.portlandgeneral.com/pge-graphql"
 
 # Cap password InitiateAuth calls to avoid account lockout.
 MAX_LOGIN_ATTEMPTS = 2
@@ -135,17 +130,6 @@ def _cognito_headers(target: str) -> dict[str, str]:
     }
 
 
-def _apigee_token_url() -> str:
-    qs = urlencode(
-        {
-            "client_id": APIGEE_CLIENT_ID,
-            "response_type": "token",
-            "redirect_uri": "",
-        }
-    )
-    return f"{APIGEE_AUTH_BASE}{APIGEE_TOKEN_PATH}?{qs}"
-
-
 def _parse_expires_at(raw: Any) -> datetime | None:
     if raw is None:
         return None
@@ -201,14 +185,14 @@ async def _post_json(
                 payload = await resp.json(content_type=None)
             except Exception as exc:  # noqa: BLE001
                 await resp.text()
-                raise PGEConnectionError(f"Non-JSON auth response ({resp.status})") from exc
+                raise PGEConnectionError(host_detail(f"Non-JSON auth response (HTTP {resp.status})", url)) from exc
             if not isinstance(payload, dict):
                 raise PGEConnectionError(f"Unexpected auth JSON type ({type(payload).__name__})")
             return resp.status, payload
     except TimeoutError as exc:
-        raise PGEConnectionError("PGE auth request timed out") from exc
+        raise PGEConnectionError(host_detail("PGE auth request timed out", url)) from exc
     except aiohttp.ClientError as exc:
-        raise PGEConnectionError(f"PGE auth connection error: {exc}") from exc
+        raise PGEConnectionError(host_detail(f"PGE auth connection error ({type(exc).__name__})", url)) from exc
 
 
 async def _cognito_initiate_auth(
@@ -243,17 +227,30 @@ async def _apigee_exchange_id_token(
     session: aiohttp.ClientSession,
     id_token: str,
 ) -> tuple[str, datetime | None]:
-    status, payload = await _post_json(
-        session,
-        _apigee_token_url(),
-        headers={"idp_access_token": id_token},
-        body=None,
-    )
-    classify_challenge(payload)
-    token = payload.get("access_token")
-    if status >= 400 or not isinstance(token, str) or not token:
-        raise PGEAuthenticationError(f"PGE Apigee token exchange failed (HTTP {status})")
-    return token, _parse_expires_at(payload.get("expires_at"))
+    resolver = get_resolver()
+    exclude: set[str] = set()
+    last_error: PGEConnectionError | None = None
+    for _attempt in range(MAX_AUTH_ATTEMPTS):
+        origin = await resolver.acquire(session, exclude=exclude)
+        try:
+            status, payload = await _post_json(
+                session,
+                token_exchange_url(origin),
+                headers={"idp_access_token": id_token},
+                body=None,
+            )
+        except PGEConnectionError as exc:
+            exclude.add(origin)
+            resolver.mark_failure(origin, status=None)
+            last_error = exc
+            continue
+        classify_challenge(payload)
+        token = payload.get("access_token")
+        if status >= 400 or not isinstance(token, str) or not token:
+            raise PGEAuthenticationError(f"PGE Apigee token exchange failed (HTTP {status})")
+        resolver.mark_success(origin, reason="token exchange succeeded")
+        return token, _parse_expires_at(payload.get("expires_at"))
+    raise last_error or PGEAuthenticationError("PGE Apigee token exchange failed")
 
 
 def _account_number_last4(value: str) -> str:
@@ -388,7 +385,7 @@ async def _enumerate_accounts_via_detail_list(
         "variables": {"params": account_detail_list_params()},
     }
     request_headers = {**headers, "Authorization": f"Bearer {access_token}"}
-    status, payload = await _post_json(session, GRAPHQL_URL, headers=request_headers, body=body)
+    status, payload = await _post_json(session, graphql_url(), headers=request_headers, body=body)
     classify_challenge(payload)
     if status >= 400:
         raise PGEAuthenticationError(f"PGE account detail list failed (HTTP {status})")
@@ -408,8 +405,8 @@ async def _discover_accounts(
         "Authorization": f"Bearer {access_token}",
         "aws_graphql_server": "graphql_server",
         "Content-Type": "application/json",
-        "Origin": "https://portlandgeneral.com",
-        "Referer": "https://portlandgeneral.com/",
+        "Origin": PGE_PORTAL_ORIGIN,
+        "Referer": PGE_PORTAL_REFERER,
     }
     # Observed operation accepts GetAccountInfoParams; null params used by portal variants.
     body = {
@@ -417,7 +414,7 @@ async def _discover_accounts(
         "query": _GET_ACCOUNT_INFO,
         "variables": {"params": None},
     }
-    status, payload = await _post_json(session, GRAPHQL_URL, headers=headers, body=body)
+    status, payload = await _post_json(session, graphql_url(), headers=headers, body=body)
     classify_challenge(payload)
     if status >= 400:
         raise PGEAuthenticationError(f"PGE account discovery failed (HTTP {status})")

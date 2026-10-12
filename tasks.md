@@ -1,5 +1,16 @@
 # Tasks
 
+## PGE API host failover (0.11.0)
+
+- [x] Single origin list plus path joiners. `portlandgeneral.com` under `custom_components/` stays in `const.py`.
+- [x] HTTP failure classes: 401/403/429 stay put. 502/503/504 and non-JSON gateway bodies fail over.
+- [x] Resolver: credential-free probe, no same-host retry ladder, circuit breaker, 24h return to the preferred host.
+- [x] Operator pin: `PGE_API_HOST` wins over Configure → API host. Foreign hosts require the unsupported opt-in.
+- [x] Bounded sibling labels are probed before credentials.
+- [x] Sync status, diagnostics, and import Store record the sticky host. No tokens in that snapshot.
+- [ ] Publish GitHub Release `v0.11.0` only after an explicit request, and only once CI is green on the pushed SHA.
+- [ ] Live HA UAT on this branch after the main checkout is no longer mid-merge.
+
 ## Issue #5 UAT follow-ups — TOD panel cost + program credit sensors (MINOR)
 
 **Context:** Live HA fact-check on [#5 comment](https://github.com/spencerthayer/homeassistant-pge/issues/5#issuecomment-5305006740) confirmed:

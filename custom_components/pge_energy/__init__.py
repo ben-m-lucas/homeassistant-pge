@@ -15,6 +15,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
 
 from .api import PGEApiClient
+from .api_host import apply_configured_host
 from .auth import PGEAuthManager
 from .backfill import async_backfill_range, async_fetch_hourly_day
 from .billing_statistics import (
@@ -29,6 +30,7 @@ from .const import (
     BACKFILL_STALL_TIMEOUT,
     CONF_ACCOUNT_ID,
     CONF_ACCOUNT_KEY,
+    CONF_API_HOST,
     CONF_AUTH_MODE,
     CONF_AUTO_BACKFILL,
     CONF_BEARER_TOKEN,
@@ -152,6 +154,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: PGEConfigEntry) -> bool:
     desired_title = pge_display_name(account_id)
     if entry.title != desired_title:
         hass.config_entries.async_update_entry(entry, title=desired_title)
+
+    apply_configured_host(get_entry_option(entry, CONF_API_HOST, None))
 
     session = aiohttp_client.async_get_clientsession(hass)
     client = PGEApiClient(

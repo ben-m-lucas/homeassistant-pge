@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_TOKEN
 from homeassistant.core import HomeAssistant
 
+from .api_host import get_resolver, public_hostname
 from .const import (
     CONF_ACCOUNT_ID,
     CONF_AUTH_MODE,
@@ -65,6 +66,7 @@ async def async_get_config_entry_diagnostics(
     coordinator = hass.data[DOMAIN][entry.entry_id]
     freshness = coordinator.freshness
 
+    host = get_resolver().sticky
     data = {
         "integration_version": VERSION,
         "ha_version": hass.version,
@@ -110,6 +112,8 @@ async def async_get_config_entry_diagnostics(
             "cost": async_resolve_sensor_entity_id(hass, coordinator.account_key, ENTITY_UNIQUE_COST),
             "temperature": async_resolve_sensor_entity_id(hass, coordinator.account_key, ENTITY_UNIQUE_TEMPERATURE),
         },
+        "api_host": public_hostname(host) if host else None,
+        "last_host_switch": get_resolver().last_switch_reason,
         "bill_pdf": {
             "download_enabled": bool(get_entry_option(entry, CONF_DOWNLOAD_BILL_PDFS, False)),
             "indexed_bills": len(coordinator.import_store.bill_pdf_index),
